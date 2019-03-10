@@ -149,3 +149,56 @@ Netty新连接接入处理的逻辑
         添加chileHandler，配置options和attrs，会调用chooser选择NioEventLoop进行绑定，绑定的时候并注册selector，这个时候
         不关心任何事件
     NioSocketChannel向selector注册读事件：注册的过程和服务端启动注册的accept事件，复用同一段逻辑；
+
+Pipeline的相关逻辑
+1、netty是如何判断ChannelHandler的类型的？
+2、对于ChannelHandler的添加应该遵循什么样的顺序？
+3、用户手动触发事件传播，不同的触发方式有什么样的区别？
+    比如inBound事件： ctx.channel.write():head->tail
+                      ctx.write():当前节点->tail
+
+    pipeline的初始化
+        pipeline在创建Channel的时候被创建；
+        pipeline节点数据结构：ChannelHandlerContext
+        pipeline的两大哨兵：head和tail
+    添加删除ChannelHandler
+        .addLast()
+            判断是否重复添加（是否有Sharable注解或已经被添加过）
+            创建节点并添加至链表(ChannelHandler里面的每一个节点都是一个ChannelHandlerContext)
+            回调添加完成事件(通过一个回调事件告诉用户这个handler添加完成了，用户可以在回调方法里面做一些事件，
+            最后把自身进行删除)
+        remove(handler)
+            找到节点
+            链表的删除(可以通过标准的链表删除方式进行删除，不用关心这个节点是否是头或尾)
+            回调删除Handler事件
+    事件和异常的传播
+        inBound事件的传播（与添加顺序正相关）
+            何为inBound事件以及ChannelInboundHandler(inBound事件主要包括registered，active，read事件，ChannelInboundHandle
+            在添加到一个pipeline的时候，会通过一个instance of关键词判断当前是一个inbound，所有的inbound事件都可以通过这个handler
+            进行处理)
+            ChannelRead事件的传播（通过添加ChannelHandler的顺序进行传播，如果通过pipeline去传播一个ChannelRead事件，他会
+            通过head节点开始往下传播，而如果通过节点的ChannelHandlerContext调用我们的fireChannelRead事件传播，那他会从当
+            前节点进行传播，最终会传播到tail节点，tail节点会进行释放）
+            SimpleInBoundHandler处理器（最大的作用就是自动释放，不用用户关心释放问题）
+        outBound事件的传播（与添加顺序逆相关）
+            何为outBound事件以及ChannelOutboundHandler(通常指的是用户主动去发起的动作，不管是读、写还是关闭连接，这个事件
+            都统称为outBound事件，ChannelOutboundHandler就是去处理这些outBound事件的handler)
+            write()事件的传播：
+                pipeline.channel.write():从tail节点开始向前传播
+                pipeline的某个节点的write()方法，会从当前节点开始向前传播
+        exception事件的传播
+            异常的触发链:跟channelHandler的添加顺序是有关的，跟inboud或者outboud是没有关系的，在其中的一个handler读写数据
+            发生异常，他会把你这个异常从当前节点开始，逐个往下传播，如果传播到最后一个节点，没有一个异常处理器的话，最终
+            会落到tail节点，tail节点默认会给你一个告警，然后把这个异常信息进行一个打印
+            异常处理的最佳实践：在pipeline的最后添加一个异常处理器，可以针对不同类型的异常进行分别处理
+    总结：
+    pipeline在服务端channel和客户端channel被创建的时候创建，创建pipeline的类是服务端和客户端channel的公共类AbstractChannel，
+    pipeline的数据结构是双向链表结构，每一个节点都是一个ChannelHandlerContext，这个context包装了用户自定义的ChannelHandler，
+    添加和删除ChannelHandler，最终都是在pipeline的链表结构中添加和删除对应的ChannelHandlerContext节点，而在添加ChannelHandlerContext
+    的过程中，使用instance of关键词来判断ChannelHandler的类型，如果该节点实现了ChannelInBoundHandler，就会设置一个boolean
+    类型的字段InBound为true来标识这个handler可以处理Inbound事件，同理outBound；默认情况下pipeline中会存在两种类型的节点，
+    一个head，一个tail，head里面的unsafe负责实现channel的具体协议，而tail节点起到了终止事件和异常传播的作用；pipeline的传播
+    机制分为三种：inBound、outBound、异常事件传播(从当前节点->tail)
+
+
+
