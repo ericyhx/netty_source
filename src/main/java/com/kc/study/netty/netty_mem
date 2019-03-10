@@ -1,0 +1,151 @@
+1、服务端的socket在哪里初始化的？
+2、在哪里accept连接
+
+Netty服务端启动
+    1、创建服务端Channel：调用jdk底层的api去创建jdk的一个channel，然后netty将其包装成为自己的channel，同时创建一些基本
+    组件，绑定在此channel上面；步骤如下：
+        bind()[用户代码入口]
+            initAndRegister()[初始化并注册]
+                newChannel()[创建服务端channel]
+                反射创建服务端channel：
+                    newSocket()[通过jdk来创建底层jdk channel]
+                    NioServerSocketChannelConfig()[tcp参数配置类]
+                    AbstractNioChannel()[NioSocketChannel的父类调用]
+                        configureBlocking(false)[阻塞模式，设置创建出来的channel是一个非阻塞的模式]
+                        AbstractChannel()[创建channel所对应的组件：id,unsafe,pipeline]
+    2、初始化服务端channel：创建完成后，netty会基于此channel做一些初始化的工作，比如初始化一些基本属性以及添加一些逻辑
+    处理器
+                初始化服务端channel
+                init()[初始化服务端channel]
+                    set ChannelOptions,ChannelAttrs
+                    set ChildOptions,ChildAttrs[为新连接创建的channel设置属性]
+                    config handler[配置服务端的pipeline]
+                    add ServerBootstrapAcceptor[添加连接处理器，这个特殊的处理器，给accept到的新连接分配一个Nio的线程]
+
+           总结：保存用户自定义的那些属性，然后通过这些属性创建一个连接接入器，连接接入器每次accept到一个新的连接后，都会
+           使用这些属性对新的连接做一些配置，
+    3、注册selector：netty将其底层的channel注册到事件轮训器selector上面，并把netty的服务端channel作为一个attachment绑定到
+    jdk底层的服务端channel，这样在后续如果有事件轮训出来的话就可以拿到这个attachment，也就是netty封装的一个服务端channel
+                注册selector：
+                AbstractChannel.register(channel)[入口]
+                    this.eventloop=eventLoop[绑定线程，对应的nio线程和当前的channel做一个绑定]
+                    register0()[实际注册]
+                        doRegister()[调用jdk底层注册，就是把当前jdk的一个channel注册到一个selector上面去]
+                        invokeHandlerAddedIfNeeded()[主要负责一些事件的回调]
+                        fireChannelRegistered()[channel注册成功的事件传播到用户的代码里面]
+    4、端口绑定：前面三步完成之后，就可以做端口绑定工作，最终也是调到jdk底层的api，实现本地端口的监听
+    这四个过程完成后，netty的服务端就启动起来了。
+                端口绑定
+                AbstractUnsafe.bind()[入口]
+                    doBind()[将端口实际绑定到本地]
+                        javaChannel().bind()[jdk底层绑定]
+                    pipeline.fireChannelActive()[传播事件]
+                        HeadContext.readIfIsAutoRead()[将之前注册到selector上的事件重新绑定为一个op_accept事件，这样有
+                        新连接进来，selector就会轮训到一个accept事件，最终就会将这个事件交给netty来出来]
+NioEventLoop启动流程
+1、默认情况下，Netty服务端起多少个线程？何时启动？
+    不设参数的时候，默认启动2*cpu核数的线程，在调用execute方法的时候，会判断调用是否在本线程，如果在本线程说明线程已经启动，
+    如果是在外部线程，调用execute方法首先会调用startThread(),会判断当前线程是否有启动，如果没有启动那就启动这个线程。
+2、Netty是如何解决jdk空轮训的bug的？
+    netty是通过一个技术的方式去判断如果当前阻塞了一个select操作，实际上并没有花这么长时间，那么有可能这一次就触发了空轮训的bug，
+    默认情况下，如果这个线程达到512次，然后就重建一个selector，把之前的selector上的所有key重新移交到新的selector，通过这个方式巧妙的
+    解决jdk空轮训的bug
+3、Netty是如何保证异步串行无锁化？
+    netty在所有外部线程去调用inEventLoop()或者channel的一些方法的时候，通过inEventLoop()来判断得出是外部线程，这个情况下
+    会将所有外部线程封装成为一个task丢到MpscQueue里面，然后在NioEventLoop执行逻辑的第三过程这些task会被挨个执行
+    NioEventLoop创建
+        new NioEventLoopGroup()[创建线程组，默认是2*cpu]
+            new ThreadPerTaskExecutor()[线程创建器]
+                每次执行任务都会创建一个线程实体
+                NioEventLoop线程命名规则nioEventLoop-1-xx
+            for(){newChild()}[构造NioEventLoop]
+                保存线程执行器ThreadPerTaskExecutor
+                创建一个MpscQueue
+                创建一个selector[轮训注册到NioEventLoop上的一个连接]
+            chooserFactor.newChooser()[线程选择器，主要负责为新连接选择一个NioEventLoop]
+                isPowerOfTwo()[判断是否是2的幂]
+                    PowerOfTwoEventExecutorChooser[优化]
+                        index++ & (length -1)[NioEventLoop的下标]
+                    GenericEventExecutorChooser[普通]
+                        abs(index++ % length)
+    NioEventLoop启动
+        服务端启动绑定端口
+        bind()->execute(task)[入口，实际绑定的流程封装成为一个task，由服务端这个execute方法具体去执行]
+            netty会判断调用execute方法的线程不是nio线程，于是会调用startThread方法开始尝试创建线程
+            startThread()->doStartThread()[创建线程]
+                ThreadPerTaskExecutor.execute()[每次执行任务的时候都会创建一个线程]
+                    thread=Thread.currentThread()[保存的目的就是为了判断后续对NioEventLoop相关的执行线程是否是本身，
+                    如果不是就封装成为一个task，扔到taskQueue里面去串行执行，保证线程安全]
+                    NioEventLoop.run()[启动]
+        新连接接入通过chooser绑定一个NioEventLoop
+    NioEventLoop执行
+        SingleThreadEventExecutor.this.run()
+        NioEventLoop.run()
+          run()->for(;;)
+            select()[轮训注册到selector上面的连接io事件，检查是否有io事件]
+                deadline以及任务穿插逻辑处理：首先计算本次执行select的一个截止时间，这个截止事件主要是根据NioEventLoop
+                当前是否有定时任务需要处理，以及判断在select的时候是否有任务需要处理，也就是说在进行select的时候如果这个时候
+                需要执行一个任务，select操作就会停止，否则就会进入下面的操作；
+                阻塞式select：默认情况下是1s
+                避免jdk空轮训的bug：
+                总结：select会进行一个deadline的处理，然后判断当前有任务在里面就终止本次select，那么如果没有到截止事件以及当前
+                taskQueue里面没有任务，就进行阻塞式的一个select操作，在阻塞式的select操作结束之后，会判断这次select操作是否真的
+                阻塞了这么长时间，那如果没有阻塞这么长时间就表明可能触发了jdk的nio的空轮训的bug，接下来netty会判断触发空轮训的次数
+                是否达到一个预值(512),如果达到了预值，就通过替换selector的操作避开了这个空轮训的bug
+            processSelectKeys()[处理io事件]
+                selected keySet的优化
+                    selected操作每次都会把已经就绪状态的io事件添加到底层一个hashSet这样的一个数据结构，而netty会通过反射
+                    的方式将HashSet替换为数组的一个实现，这样在任何情况下他操作的时间复杂度都是O(1),优于HashSet
+                    processSelectKeysOptimized()
+            runAllTasks()[处理异步任务队列，处理外部线程扔到taskQueue里面的任务]
+                task的分类和添加：
+                    普通task：MqscQueue
+                    定时任务的task
+                任务的聚合：首先会将定时任务里task聚合到普通任务
+                任务的执行
+            netty在执行这些任务的时候，首先会将定时任务聚合到普通任务里面，然后挨个去执行这些任务，并且在每次默认
+            情况下执行64个任务之后计算一下当前的时间是否超过最大允许执行时间，，如果超过就直接中断，中断之后就进行
+            下一次的NioEvenLoop的执行循环
+总结：
+NioEventLoop创建：
+    用户代码在创建bossGroup和workerGroup的时候，NioEventLoop被创建，默认参数会创建2*cpu核数的NioEventLoop，每个NioEventLoop
+都会有一个chooser进行线程逻辑的分配，这个chooser也会针对NioEventLoop的个数做一定优化，NioEventLoop在创建的时候会创建一个
+selector和一个定时任务队列，在创建selector的时候，netty会通过反射的方式用数组实现来替换掉selected的两个hashSet数据结构；
+NioEventLoop启动：
+    NioEventLoop在首次调用execute方法的时候启动线程，这个线程是一个FastThreadLocalThread,启动线程之后，netty会将创建完成
+的线程保存到成员变量，这样就能判断执行NioEventLoop里面的逻辑是否是本线程
+NioEventLoop执行逻辑：
+    NioEventLoop执行逻辑在run()里面，主要包括三个过程，第一个是检测io事件，第二个过程是处理这些io事件，最后执行任务队列；
+
+Netty新连接接入
+1、Netty是在哪里检测有新连接接入的？
+    boss线程的第一个过程，轮训出accept事件，然后boss线程的第二个线程，通过jdk底层的channel.accept去创建这条连接
+2、新连接是怎样注册到NioEventLoop线程的？
+    boss线程调用chooser的next方法，拿到一个NioEventLoop，然后将这条连接注册到NioEventLoop的selector上面去
+Netty新连接接入处理的逻辑
+    检测新连接：新连接通过服务端channel绑定的selector轮训出accept事件；
+        processSelectedKey(key,channel)[入口]
+            NioMessageUnsafe.read()
+                doReadMessages()[while循环调用，来创建新连接对象]
+                    javaChannel().accept()[创建新连接最核心的方法,通过一个handler控制连接速率，默认最大一次读取16个连接]
+    创建NioSocketChannel：检测新连接之后基于jdk的nio的channel创建一个Netty的NioSocketChannel，也就是客户端channel
+        new NioSocketChannel(parent,ch)[入口，服务端channel通过反射的方式创建，为什么？]
+            AbstractNioByteChannel(p,ch,op_read)[逐层调用父类的构造函数做一些事情]
+                configureBlocking(false)&save op[首先配置此channel为非阻塞，然后将感兴趣的读事件保存到成员变量，方便后续逐层到seletor上]
+                create id,unsafe,pipline[创建和此channel相关的一些组件，id作为唯一标识，unsafe作为底层数据的读写，pipeline作为业务逻辑的载体]
+            new NioSocketChannelConfig(this, socket.socket())[创建一个和NioSocketChannel绑定的配置类]
+                setTcpNoDelay(true)[禁用Nagle算法，小的数据包尽可能的会发出去，降低延时]
+            Netty中Channel分类：
+                NioServerSocketChannel->服务端channel
+                NioSocketChannel->通过new关键字显示的创建客户端channel
+                Unsafe->用于实现每种channel底层自己的协议
+    分配线程及注册selector：Netty给客户端channel分配一个NioEventLoop，并且把这条channel注册到NioEventLoop对应的selector上，
+    至此，这条channel后续的读写都由此NioEventLoop进行管理；
+        ServerBootstrapAcceptor[连接接入器]
+            添加chileHandler
+            设置options和attrs
+            选择NioEventLoop并注册selector
+        服务端channel在检测到新连接并且创建完成客户端channel之后会调用一个连接器做一些处理，这些处理包括填充逻辑处理器，
+        添加chileHandler，配置options和attrs，会调用chooser选择NioEventLoop进行绑定，绑定的时候并注册selector，这个时候
+        不关心任何事件
+    NioSocketChannel向selector注册读事件：注册的过程和服务端启动注册的accept事件，复用同一段逻辑；
